@@ -1,0 +1,9 @@
+UPDATE tenant_data_record set tenant_id ='T8799830349253642' WHERE tenant_id = 'T879983034925364-2019-08-20';
+
+UPDATE data_relation set tenant_id ='T8799830349253642' WHERE tenant_id = 'T879983034925364-2019-08-20';
+
+//手动改管理员的账号后缀
+update 
+"T8799830349253642".user_info set account= CONCAT(EXTERNAL_id,'@dazd.test'),ENABLE=FALSE WHERE id != '8200036162679811';
+
+

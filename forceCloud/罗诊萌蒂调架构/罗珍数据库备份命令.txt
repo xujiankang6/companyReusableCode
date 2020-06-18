@@ -1,0 +1,22 @@
+﻿命令1  prod备份：
+
+密码：PowerCrm_*_+zol7
+
+pg_dump -h crmpower-prod.c7z99mmkjyry.rds.cn-north-1.amazonaws.com.cn -p 5432 -U crmpowerdbadmin -d crmpower -n \"T8200040335019009\" > T8200040335019009.sql
+
+
+命令2 修改名称：
+
+sed -i "s/T8200040335019009/T879983034925364-`date +%F`/g" T8200040335019009.sql
+
+命令3  stg恢复：
+
+psql -h crmpower.c7z99mmkjyry.rds.cn-north-1.amazonaws.com.cn -U crmpowerdbadmin -d crmpower -f T8200040335019009.sql
+
+
+
+登录stg数据库
+
+查看名称 T879983034925364 +当前日期的schema  即可
+
+需要更改名称，自行更改！
