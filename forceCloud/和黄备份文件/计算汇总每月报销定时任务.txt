@@ -1,0 +1,160 @@
+//package com.forceclouds.crm.local
+
+import com.forceclouds.context.ContextHolder
+import com.forceclouds.crm.data.model.Criteria
+import com.forceclouds.crm.data.model.DataRecord
+import com.forceclouds.crm.data.model.IDataRecord
+import com.forceclouds.crm.data.model.Query
+import com.forceclouds.crm.data.repository.IDataRecordRepository
+import com.forceclouds.crm.data.service.IDataRecordService
+import com.forceclouds.crm.metadata.model.IObjectDescribe
+import com.forceclouds.crm.metadata.service.IObjectDescribeService
+import com.forceclouds.crm.scheduler.CRMJob
+import org.slf4j.LoggerFactory
+import java.time.*
+import java.time.format.DateTimeFormatter
+import java.util.stream.Collectors
+
+/*
+*@create by QY.gao 2020.02.06
+*
+* modify by wangning batchDelete、batchInsert  IDataRecordService 20200407
+*/
+
+class SummarizeMonthlyExpensesJob implements CRMJob {
+
+    def logger = LoggerFactory.getLogger(SummarizeMonthlyExpensesJob.class)
+    IDataRecordService dataRecordService
+    IDataRecordRepository dataRecordRepository
+    IObjectDescribeService objectDescribeService
+
+    @Override
+    void execute(Map<String, Object> params) {
+        dataRecordRepository = getBean(IDataRecordRepository.class)
+        objectDescribeService = getBean(IObjectDescribeService.class)
+        dataRecordService = getBean(IDataRecordService.class)
+        calculateSumMoney()
+    }
+
+    def calculateSumMoney() {
+        logger.info("汇总每月费用,定时任务,执行时间:" + System.currentTimeMillis())
+        ZoneId zone = ZoneId.of("UTC+8")
+        Instant endTime = LocalDateTime.of(LocalDate.of(LocalDate.now().year, LocalDate.now().month, 1), LocalTime.MIN).toInstant(ZoneOffset.of("+8"))
+        Long endTimestamp = LocalDateTime.ofInstant(endTime, zone).atZone(zone).toInstant().toEpochMilli()
+
+        Instant startTime = LocalDateTime.of(LocalDate.of(LocalDate.now().year, LocalDate.now().month, 1).minusMonths(1), LocalTime.MIN).toInstant(ZoneOffset.of("+8"))
+        Long startTimestamp = LocalDateTime.ofInstant(startTime, zone).atZone(zone).toInstant().toEpochMilli()
+        String time = LocalDateTime.ofInstant(startTime, zone).format(DateTimeFormatter.ofPattern("yyyyMM"))
+        //查询报销单据数据
+        List<IDataRecord> reimbursements = queryReimbursements(startTimestamp, endTimestamp)
+        Map<Long, List<IDataRecord>> map = new HashMap<>()
+        if (reimbursements != null && reimbursements.size() > 0) {
+            map = reimbursements.groupBy { e -> e.lecture }
+        }
+
+        List<IDataRecord> dataRecords = new ArrayList<>()
+
+        List<Long> lectures = new ArrayList(map.keySet())
+        for (int i = 0; i < lectures.size(); i++) {
+            IDataRecord dataRecord = new DataRecord()
+
+            Long lecture = lectures.get(i)
+            List<IDataRecord> reimbursement = map.get(lecture)
+
+            BigDecimal sum_moneys = new BigDecimal(0)
+            reimbursement.stream().forEach { e ->
+                BigDecimal sum_money = new BigDecimal(e.getOrDefault("sum_money", 0))
+                sum_moneys = sum_moneys.add(sum_money)
+            }
+            dataRecord.sum_money = sum_moneys
+            dataRecord.month = startTimestamp
+            dataRecord.lecture = lecture
+            dataRecord.lecture_code = reimbursement.get(0).lecture_code
+            dataRecord.external_id = time + "-" + dataRecord.lecture_code
+            dataRecord.__jobFlag__ = "JOBFLAG"
+            dataRecords.add(dataRecord)
+        }
+        if (dataRecords != null && dataRecords.size() > 0) {
+            saveMonthlyReimbursement(dataRecords)
+        }
+        logger.info("汇总每月费用,定时任务执行成功:" + System.currentTimeMillis())
+    }
+
+    def saveMonthlyReimbursement(List<IDataRecord> list) {
+        List<String> externalIds = list.stream().map { e -> e.external_id }.collect(Collectors.toList())
+        List<IDataRecord> oldData = queryReimbursementData(externalIds)
+
+        IObjectDescribe objectDescribe = objectDescribeService.findByApiName("monthly_reimbursement")
+        if (null != oldData && oldData.size() > 0) {
+            Map<String, Object> reimbursementMap = new HashMap<>()
+            oldData.stream().forEach() { e -> reimbursementMap.put(e.external_id, e.getId()) }
+            Map<String, Object> reimbursementVersionMap = new HashMap<>()
+            oldData.stream().forEach() { e -> reimbursementVersionMap.put(e.external_id, e.version) }
+
+            List<IDataRecord> updateDataRecord = new ArrayList<>()
+            //更新 update的数据
+            for (int i = 0; i < list.size(); i++) {
+                Map<String, Object> dataRecord = list.get(i)
+
+                if (reimbursementMap.get(String.valueOf(dataRecord.get("external_id"))) != null) {
+                    IDataRecord newDataRecord = new DataRecord()
+                    newDataRecord.put("id", reimbursementMap.get(String.valueOf(dataRecord.get("external_id"))))
+                    newDataRecord.put("version", reimbursementVersionMap.get(String.valueOf(dataRecord.get("external_id"))))
+                    newDataRecord.put("sum_money", dataRecord.sum_money)
+                    newDataRecord.put("month", dataRecord.month)
+                    newDataRecord.put("lecture", dataRecord.lecture)
+                    newDataRecord.put("lecture_code", dataRecord.lecture_code)
+                    newDataRecord.__jobFlag__ = "JOBFLAG"
+                    updateDataRecord.add(newDataRecord)
+                    list.remove(i)
+                    i--
+                }
+            }
+
+            if (null != updateDataRecord && updateDataRecord.size() > 0) {
+                dataRecordService.batchUpdate(ContextHolder.getHolder().get(), objectDescribe, updateDataRecord)
+            }
+        }
+        //需要insert的
+        if (null != list && list.size() > 0) {
+            dataRecordService.batchInsert(ContextHolder.getHolder().get(), objectDescribe, list)
+        }
+    }
+
+    /**
+     * 查询单据信息表数据
+     */
+    def queryReimbursements(Long startTimestamp, Long endTimestamp) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'reimbursement_document'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("lock_time", ">=", startTimestamp))
+        queryDept.criterias.add(new Criteria("lock_time", "<", endTimestamp))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    def queryReimbursementData(List<String> externalIds) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'monthly_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("external_id", "in", externalIds))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+}

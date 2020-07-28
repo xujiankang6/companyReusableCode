@@ -1,0 +1,137 @@
+//package com.forceclouds.crm.local
+
+import com.forceclouds.context.ContextHolder
+import com.forceclouds.context.HeadCode
+import com.forceclouds.context.impl.MapRestResponse
+import com.forceclouds.crm.action.AbstractAction
+import com.forceclouds.crm.anno.DebugCondition
+import com.forceclouds.crm.anno.ObjectDescribeAction
+import com.forceclouds.crm.data.model.Criteria
+import com.forceclouds.crm.data.model.IDataRecord
+import com.forceclouds.crm.data.model.Query
+import com.forceclouds.crm.data.repository.IDataRecordRepository
+import com.forceclouds.crm.data.service.IDataRecordService
+import com.forceclouds.crm.metadata.service.IObjectDescribeService
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Conditional
+import org.springframework.stereotype.Component
+import java.util.stream.Collectors
+/*
+*@create by QY.gao 2020.02.20
+*/
+//@Component
+//@ObjectDescribeAction(target = 'customer', api_name = 'update_tax_status_action')
+//@Conditional(DebugCondition.class)
+class UpdateTaxStatus  extends AbstractAction {
+    def logger = LoggerFactory.getLogger(UpdateTaxStatus.class)
+    IDataRecordRepository dataRecordRepository
+    IObjectDescribeService objectDescribeService
+    IDataRecordService dataRecordService
+
+    @Override
+    MapRestResponse exec(List<Long> ids, Map<String, Object> requestParams, Map<String, ?> customActionDefinition) {
+        dataRecordRepository = applicationContext.getBean(IDataRecordRepository.class)
+        objectDescribeService = applicationContext.getBean(IObjectDescribeService.class)
+        dataRecordService = applicationContext.getBean(IDataRecordService.class)
+        updateStatus()
+        MapRestResponse.build(HeadCode.SUCCESS)
+    }
+
+    def updateStatus(){
+        logger.info("更新月度报税状态,手动触发 action,执行时间:"+System.currentTimeMillis())
+        List<IDataRecord> undeclaredReimbursements = queryUndeclaredReimbursement()
+        if(undeclaredReimbursements != null && undeclaredReimbursements.size()>0 ){
+
+            List<String> lectureCodes = undeclaredReimbursements.stream().map{e-> e.lecture_code }.collect(Collectors.toList())
+            List<IDataRecord> monthlyReimbursements = queryMonthlyReimbursement( lectureCodes)
+
+            if(monthlyReimbursements != null && monthlyReimbursements.size() >0){
+                monthlyReimbursements.forEach{e-> e.completed_tax = true }
+                updateMonthlyReimbursement(monthlyReimbursements)
+            }
+
+            //CRM-6600 更新customer的身份状态和是否首次报税
+            List<String> externalIds = undeclaredReimbursements.stream().map { e -> e.external_id }.collect(Collectors.toList())
+            List<IDataRecord> customer = queryCustomer(externalIds)
+
+            List<IDataRecord> customers = customer.stream().filter{e-> e.id_number_status == null || e.id_number_status != '验证通过'}
+                    .filter{e-> e.declare_tax_first_time == null || e.declare_tax_first_time != false}.collect(Collectors.toList())
+            if (customers != null && customers.size() > 0) {
+                customers.forEach { e ->
+                    e.id_number_status = '验证通过'
+                    e.declare_tax_first_time = false
+                }
+                updateCustomers(customers)
+            }
+        }
+        logger.info("更新月度报税状态,手动触发 action,执行成功,执行时间:"+System.currentTimeMillis())
+    }
+
+    def updateMonthlyReimbursement(List<IDataRecord> list){
+        dataRecordService.batchUpdate(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("monthly_reimbursement"), list)
+    }
+
+    def updateCustomers(List<IDataRecord> updateCustomerRecords) {
+        dataRecordService.batchUpdate(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("customer"), updateCustomerRecords)
+    }
+
+    /**
+     * 查询未报税报销汇总数据
+     */
+    def queryMonthlyReimbursement(List<String> lectureCodes) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'monthly_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("lecture_code", "in", lectureCodes))
+        queryDept.criterias.add(new Criteria("completed_tax", "<>", true))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    /**
+     * 查询未报税报销汇总数据
+     */
+    def queryUndeclaredReimbursement() {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'undeclared_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("completed_tax", "==", true))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    /**
+     * 查询customer
+     */
+    def queryCustomer(List<String> externalIds) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'customer'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.setNeedRelationQuery(false)
+        queryDept.criterias.add(new Criteria("external_id", "in", externalIds))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        return new ArrayList<IDataRecord>()
+    }
+
+}

@@ -1,0 +1,206 @@
+//package com.forceclouds.crm.local
+
+import com.forceclouds.context.ContextHolder
+import com.forceclouds.context.impl.MapRestResponse
+import com.forceclouds.crm.action.AbstractAction
+import com.forceclouds.crm.anno.DebugCondition
+import com.forceclouds.crm.anno.ObjectDescribeAction
+import com.forceclouds.crm.data.model.Criteria
+import com.forceclouds.crm.data.model.DataRecord
+import com.forceclouds.crm.data.model.IDataRecord
+import com.forceclouds.crm.data.model.Query
+import com.forceclouds.crm.data.repository.impl.PgDataRecordRepository
+import com.forceclouds.crm.data.service.IDataRecordService
+import com.forceclouds.crm.metadata.model.pgimpl.ObjectDescribe
+import com.forceclouds.crm.metadata.service.IObjectDescribeService
+import com.google.common.collect.Maps
+import org.apache.commons.lang3.StringUtils
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Conditional
+import org.springframework.stereotype.Component
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.stream.Collectors
+
+/**
+ * 医生合并数据_计算每月汇总费用
+ * Created  by QY.gao on 2020.03.03
+ */
+//@Component
+//@ObjectDescribeAction(target = 'monthly_reimbursement', api_name = 'merge_hcp_summarize_monthly')
+//@Conditional(DebugCondition.class)
+class MergeHcpSummarizeMonthly extends AbstractAction {
+
+    Logger logger = LoggerFactory.getLogger(MergeHcpSummarizeMonthly.class)
+    PgDataRecordRepository dataRecordRepository
+    IObjectDescribeService objectDescribeService
+    IDataRecordService dataRecordService
+
+    @Override
+    MapRestResponse exec(List<Long> ids, Map<String, Object> requestParams, Map<String, ?> customActionDefinition) {
+        dataRecordRepository = applicationContext.getBean(PgDataRecordRepository.class)
+        objectDescribeService = applicationContext.getBean(IObjectDescribeService.class)
+        dataRecordService = applicationContext.getBean(IDataRecordService.class)
+
+        ZoneId zone = ZoneId.of("UTC+8")
+        Instant endTime = LocalDateTime.of(LocalDate.of(LocalDate.now().year,LocalDate.now().month,1).minusMonths(1), LocalTime.MIN).toInstant(ZoneOffset.of("+8"))
+        Long endTimestamp = LocalDateTime.ofInstant(endTime, zone).atZone(zone).toInstant().toEpochMilli()
+        String time = LocalDateTime.ofInstant(endTime, zone).format(DateTimeFormatter.ofPattern("yyyyMM"))
+
+        calculateMergeHcpSumMoney(endTimestamp, time)
+
+        Map<String,Object> map = new HashMap<>()
+//        map.put("value",dataRecords)
+        return MapRestResponse.build().data(map)
+    }
+    def calculateMergeHcpSumMoney(Long endTimestamp, String time){
+        logger.info("处理医生合并数据-计算汇总每月费用,定时任务,手动触发action:"+System.currentTimeMillis())
+
+        //1生产的集合A(被删除的讲者是否有未报税的记录)
+        List<IDataRecord> monthlyReimbursementList = queryRecord( endTimestamp)
+
+        if(monthlyReimbursementList != null){
+            //2.1 为空的数据,需要记录错误日志信息
+            List<IDataRecord> emptyMergedIntoHcp = monthlyReimbursementList.stream().filter{e-> e.merged_into_hcp == null }.collect(Collectors.toList())
+
+            //记录一条报错信息emptyMergedIntoHcp
+            List<IDataRecord> lectureMessageList = new ArrayList<>()
+            for(int i = 0 ; i<emptyMergedIntoHcp.size() ; i++){
+                IDataRecord dataRecord = new DataRecord()
+                dataRecord.lecture = emptyMergedIntoHcp.get(i).lecture
+                dataRecord.lecture_code = emptyMergedIntoHcp.get(i).lecture_code
+                dataRecord.monthly_reimbursement = emptyMergedIntoHcp.get(i).monthly_reimbursement
+                dataRecord.error_message = "讲者编码" + emptyMergedIntoHcp.get(i).lecture_code + "已被设置为失效但未找到对应的有效讲者"
+                lectureMessageList.add(dataRecord)
+            }
+            if(lectureMessageList != null && lectureMessageList.size() > 0){
+                dataRecordService.batchInsert(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("lecture_message"), lectureMessageList)
+            }
+            //集合A不为空的数据
+            List<IDataRecord> mergedIntoHcp = monthlyReimbursementList.stream().filter{e-> e.merged_into_hcp != null }.collect(Collectors.toList())
+            List<Long> mergedIntoHcps = mergedIntoHcp.stream().map{e-> e.merged_into_hcp }.distinct().collect(Collectors.toList())
+
+            //2.2 集合B的数据
+            List<IDataRecord> monthlyReimbursements = new ArrayList<>()
+            if(mergedIntoHcps.size() > 0){
+                monthlyReimbursements = queryMonthlyReimbursement(mergedIntoHcps, endTimestamp)
+            }
+
+            List<IDataRecord> updateRecords = new ArrayList<>()
+            List<IDataRecord> insertRecords = new ArrayList<>()
+            List<Long> deleteRecords = new ArrayList<>()
+            for(int i = 0 ; i <mergedIntoHcps.size() ; i++){
+                Long id = mergedIntoHcps.get(i)
+
+                //1中的集合 里面的,merged_into_hcp = 当前的merged_into_hcp;  无效的未报税的数据(被删除的讲者是否有未报税的记录)
+                List<IDataRecord> list1 = mergedIntoHcp.stream().filter{e-> e.merged_into_hcp == id }.collect(Collectors.toList())
+
+                //2 - 2中的集合 里面的,lecture = 当前的merged_into_hcp;  有效的未报税的数据
+                List<IDataRecord> list2 = monthlyReimbursements.stream().filter{e-> e.lecture == id}.collect(Collectors.toList())
+
+                if(list2 .size() > 0 ){//需要更新真实数据
+                    IDataRecord dataRecord = list2.get(0)
+
+                    BigDecimal sumMoney = new BigDecimal(0)
+                    for (int j=0 ; j<list1.size() ; j++){
+                        IDataRecord record = list1.get(j)
+                        sumMoney = sumMoney.add(record.sum_money)
+                        deleteRecords.add(record.monthly_reimbursement )
+                    }
+                    dataRecord.sum_money = sumMoney + dataRecord.sum_money
+
+                    updateRecords.add(dataRecord)
+
+                }else{//没有真实数据
+                    BigDecimal sumMoney = new BigDecimal(0)
+                    for (int j=0 ; j<list1.size() ; j++){
+                        IDataRecord record = list1.get(j)
+                        sumMoney = sumMoney.add(record.sum_money)
+                        deleteRecords.add(record.monthly_reimbursement )
+                    }
+                    IDataRecord dataRecord = new DataRecord()
+                    dataRecord.lecture = list1.get(0).merged_into_hcp
+                    dataRecord.lecture_code = list1.get(0).merged_external_id
+                    dataRecord.external_id = time + "-" + list1.get(0).merged_external_id
+                    dataRecord.sum_money = sumMoney
+                    dataRecord.month = endTimestamp
+
+                    insertRecords.add(dataRecord)
+                }
+            }
+
+            ObjectDescribe objectDescribe = objectDescribeService.findByApiName("monthly_reimbursement")
+
+            if(insertRecords.size() > 0){
+                dataRecordService.batchInsert(ContextHolder.get(), objectDescribe, insertRecords)
+            }
+            if(updateRecords.size() > 0){
+                dataRecordService.batchUpdate(ContextHolder.get(), objectDescribe, updateRecords)
+            }
+            if(deleteRecords.size() > 0){
+                dataRecordService.batchDelete(ContextHolder.get(), objectDescribe, deleteRecords as Long[])
+            }
+        }
+
+        logger.info("处理医生合并数据-计算汇总每月费用,手动触发action执行成功:"+System.currentTimeMillis())
+    }
+
+    def queryRecord(Long endTimestamp){
+        String tenantId = ContextHolder.tenantId
+        if (StringUtils.isEmpty(tenantId)) {
+            throw new IllegalArgumentException("当前用户的 tenantId 不能为空")
+        }
+        String sql = "select mr.id as monthly_reimbursement,\n" +
+                "\tmr.lecture as lecture,\n" +
+                "\tmr.lecture_code as lecture_code,\n" +
+                "\tmr.month as month,\n" +
+                "\tmr.sum_money as sum_money,\n" +
+                "\t(c.ext->>'merged_into_hcp')::int8 as merged_into_hcp,\n" +
+                "\tmc.external_id as merged_external_id\n" +
+                "from \""+tenantId+"\".monthly_reimbursement mr\n" +
+                "left join \""+tenantId+"\".customer c on mr.lecture = c.id and c.is_deleted = false\n" +
+                "left join \""+tenantId+"\".customer mc on mc.id = (c.ext->>'merged_into_hcp')::int8 and mc.is_deleted = false\n" +
+                "where mr.is_deleted =:is_deleted\n" +
+                "\tand mr.completed_tax =:completed_tax\n" +
+                "\tand c.is_active =:is_active\n" +
+                "\tand mr.month =:month\n" +
+                "\tand c.record_type =:record_type"
+        Map<String, String> params = Maps.newHashMap()
+        params.put("is_deleted",false)
+        params.put("completed_tax",false)
+        params.put("is_active",false)
+        params.put("month",endTimestamp)
+        params.put("record_type","speaker")
+        List<IDataRecord> list = dataRecordRepository.findBySql(sql,params)
+
+        return list
+    }
+
+    /**
+     * 查询单据信息表数据
+     */
+    def queryMonthlyReimbursement(List<Long> lectures, Long endTimestamp) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'monthly_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("completed_tax", "==", false))
+        queryDept.criterias.add(new Criteria("lecture", "in", lectures))
+        queryDept.criterias.add(new Criteria("month", "==", endTimestamp))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        return new ArrayList<IDataRecord>()
+    }
+
+}

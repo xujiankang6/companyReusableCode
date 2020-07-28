@@ -1,0 +1,142 @@
+//package com.forceclouds.crm.local
+
+import com.forceclouds.context.ContextHolder
+import com.forceclouds.context.HeadCode
+import com.forceclouds.context.impl.MapRestResponse
+import com.forceclouds.crm.action.AbstractAction
+import com.forceclouds.crm.anno.DebugCondition
+import com.forceclouds.crm.anno.ObjectDescribeAction
+import com.forceclouds.crm.data.model.Criteria
+import com.forceclouds.crm.data.model.DataRecord
+import com.forceclouds.crm.data.model.IDataRecord
+import com.forceclouds.crm.data.model.Query
+import com.forceclouds.crm.data.repository.IDataRecordRepository
+import com.forceclouds.crm.data.service.IDataRecordService
+import com.forceclouds.crm.metadata.service.IObjectDescribeService
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Conditional
+import org.springframework.stereotype.Component
+import java.util.stream.Collectors
+/*
+*@create by QY.gao 2020.02.20
+*/
+//@Component
+//@ObjectDescribeAction(target = 'customer', api_name = 'summary_unreported_action')
+//@Conditional(DebugCondition.class)
+class SummaryUnreportedReimbursement  extends AbstractAction {
+    def logger = LoggerFactory.getLogger(SummaryUnreportedReimbursement.class)
+    IDataRecordRepository dataRecordRepository
+    IObjectDescribeService objectDescribeService
+    IDataRecordService dataRecordService
+
+    @Override
+    MapRestResponse exec(List<Long> ids, Map<String, Object> requestParams, Map<String, ?> customActionDefinition) {
+        dataRecordRepository = applicationContext.getBean(IDataRecordRepository.class)
+        objectDescribeService = applicationContext.getBean(IObjectDescribeService.class)
+        dataRecordService = applicationContext.getBean(IDataRecordService.class)
+        calculateSumMoney()
+        MapRestResponse.build(HeadCode.SUCCESS)
+    }
+
+    def calculateSumMoney(){
+        logger.info("更新未报税报销汇总表undeclared_reimbursement,手动触发,执行时间:"+System.currentTimeMillis())
+
+        deletedUndeclaredReimbursement()
+        //查询月度报销汇总数据
+        List<IDataRecord> monthlyReimbursements = queryMonthlyReimbursement()
+        Map<Long,List<IDataRecord>> map = new HashMap<>()
+        List<Long> lectureIds = new ArrayList<>()
+        if(monthlyReimbursements != null && monthlyReimbursements.size() >0) {
+            map = monthlyReimbursements.groupBy { e -> e.lecture }
+            lectureIds = monthlyReimbursements.stream().map{e-> e.lecture}.distinct().collect(Collectors.toList())
+        }
+
+        //查询所有讲者的 id_number
+
+        Map<Long, String> customerMap = new HashMap<>()
+        if(lectureIds != null && lectureIds.size() > 0){
+            List<IDataRecord> customer = dataRecordRepository.findByIds(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("customer"), lectureIds)
+            if(customer != null && customer.size() > 0){
+                customer.forEach{e-> customerMap.put(e.id , e.id_number.toString().trim() == ""?null:e.id_number) }
+            }
+        }
+        List<IDataRecord> dataRecords = new ArrayList<>()
+
+        List<Long> lectures = new ArrayList(map.keySet())
+        for(int i=0 ; i<lectures.size() ; i++){
+            IDataRecord dataRecord = new DataRecord()
+
+            Long lecture = lectures.get(i)
+            List<IDataRecord> monthlyReimbursement = map.get(lecture)
+
+            BigDecimal sum_moneys = new BigDecimal(0)
+            monthlyReimbursement.stream().forEach {e->
+                BigDecimal sum_money = new BigDecimal(e.getOrDefault("sum_money",0))
+                sum_moneys = sum_moneys.add(sum_money)
+            }
+            dataRecord.sum_money = sum_moneys
+            dataRecord.lecture = lecture
+            dataRecord.lecture_code = monthlyReimbursement.get(0).lecture_code
+            dataRecord.external_id = monthlyReimbursement.get(0).lecture_code
+            dataRecord.id_number = customerMap.get(lecture)
+            dataRecord.completed_tax = false
+
+            dataRecords.add(dataRecord)
+        }
+        if(dataRecords != null && dataRecords.size() > 0){
+            saveUndeclaredReimbursement(dataRecords)
+        }
+        logger.info("更新未报税报销汇总表undeclared_reimbursement,手动触发,手动触发执行成功:"+System.currentTimeMillis())
+    }
+
+    def deletedUndeclaredReimbursement(){
+        List<IDataRecord> undeclaredReimbursements = queryUndeclaredReimbursement()
+        if(undeclaredReimbursements != null && undeclaredReimbursements.size()>0){
+            List<Long> idList = undeclaredReimbursements.stream().map{e-> e.id}.collect(Collectors.toList())
+            Long[] ids = idList.toArray()
+            dataRecordService.batchDelete(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("undeclared_reimbursement"), ids)
+        }
+    }
+
+    def saveUndeclaredReimbursement(List<IDataRecord> list){
+        dataRecordService.batchInsert(ContextHolder.getHolder().get(), objectDescribeService.findByApiName("undeclared_reimbursement"), list)
+    }
+
+    /**
+     * 查询单据信息表数据
+     */
+    def queryMonthlyReimbursement() {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'monthly_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("completed_tax", "==", false))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    /**
+     * 查询未报税报销汇总数据
+     */
+    def queryUndeclaredReimbursement() {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'undeclared_reimbursement'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+}

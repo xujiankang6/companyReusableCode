@@ -1,0 +1,453 @@
+//package com.forceclouds.crm.local
+
+import com.forceclouds.context.ContextHolder
+import com.forceclouds.context.HeadCode
+import com.forceclouds.context.exception.IllegalCustomizationException
+import com.forceclouds.context.impl.MapRestResponse
+import com.forceclouds.crm.action.AbstractAction
+import com.forceclouds.crm.anno.DebugCondition
+import com.forceclouds.crm.anno.ObjectDescribeAction
+import com.forceclouds.crm.data.model.Criteria
+import com.forceclouds.crm.data.model.DataRecord
+import com.forceclouds.crm.data.model.IDataRecord
+import com.forceclouds.crm.data.model.Query
+import com.forceclouds.crm.data.repository.IDataRecordRepository
+import com.forceclouds.crm.data.service.IDataRecordService
+import com.forceclouds.crm.metadata.model.IObjectDescribe
+import com.forceclouds.crm.metadata.service.IObjectDescribeService
+import com.google.common.base.Joiner
+import org.apache.commons.codec.digest.DigestUtils
+import org.apache.commons.lang3.time.DateUtils
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Conditional
+import org.springframework.core.env.Environment
+import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.http.HttpEntity
+import org.springframework.http.HttpHeaders
+import org.springframework.http.MediaType
+import org.springframework.stereotype.Component
+import org.springframework.web.client.RestClientException
+import org.springframework.web.client.RestTemplate
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
+import java.util.stream.Collectors
+/*
+*@create by QY.gao 2020.02.05
+*/
+//@Component
+//@ObjectDescribeAction(target = 'customer', api_name = 'daily_reimbursement_data')
+//@Conditional(DebugCondition.class)
+class DailyReimbursementData  extends AbstractAction {
+    def logger = LoggerFactory.getLogger(DailyReimbursementData.class)
+    def dataRecordRepository
+    def dataRecordService
+    def objectDescribeService
+    private RestTemplate restTemplate
+    private Environment env
+    private RedisTemplate<String, Object> redisTemplate
+
+    @Override
+    MapRestResponse exec(List<Long> ids, Map<String, Object> requestParams, Map<String, ?> customActionDefinition) {
+        dataRecordRepository = applicationContext.getBean(IDataRecordRepository.class) as IDataRecordRepository
+        dataRecordService = applicationContext.getBean(IDataRecordService.class) as IDataRecordService
+        objectDescribeService = applicationContext.getBean(IObjectDescribeService.class) as IObjectDescribeService
+        restTemplate = applicationContext.getBean(RestTemplate.class)
+        env = applicationContext.getBean(Environment.class)
+        redisTemplate = applicationContext.getBean("redisTemplate")
+
+        String setKey = "daily_reimbursement_data_setKey"
+        if(redisTemplate.hasKey(setKey)){
+            IllegalCustomizationException innerException = new IllegalCustomizationException("报销单据还未同步完,请稍后!")
+            throw new IllegalCustomizationException("报销单据还未同步完,请稍后!", innerException, "500")
+        }
+        redisTemplate.opsForValue().set(setKey, "1", 120, TimeUnit.SECONDS)
+
+        ZoneId zone = ZoneId.of("UTC+8")
+
+        //默认pageSize 100,最大100
+        int pageSize = 100
+        List<IDataRecord> resList= new ArrayList<>()
+        List<IDataRecord> statisticList = new ArrayList<>()
+        boolean flag = true
+        String errorMessage
+
+        a:for(int i = 0; i<4 ; i++){
+            Instant endLockTimeInstant = LocalDateTime.of(LocalDate.now().minusDays(i), LocalTime.MAX).toInstant(ZoneOffset.of("+8"))
+            String endLockTime = LocalDateTime.ofInstant(endLockTimeInstant, zone).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+            Instant startLockTimeInstant = LocalDateTime.of(LocalDate.now().minusDays(i), LocalTime.MIN).toInstant(ZoneOffset.of("+8"))
+            String startLockTime = LocalDateTime.ofInstant(startLockTimeInstant, zone).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+            String day = LocalDateTime.ofInstant(startLockTimeInstant, zone).format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+
+            IDataRecord statistic = new DataRecord()
+            List<IDataRecord> emptyList = new ArrayList<>()
+
+            Map<String,Object> map = queryReimbursement(1, pageSize,startLockTime,endLockTime)
+            Map<String,Object> response = map.response
+
+            if(map.successFlag == true){
+                List<IDataRecord> list = response.DATA
+                if (response.COUNT > 0) {
+                    int num
+                    if(response.COUNT % pageSize == 0){
+                        num = response.COUNT / pageSize
+                    }else{
+                        num = response.COUNT / pageSize + 1
+                    }
+                    for (int j = 2; j <= num; j++) {
+                        Map<String,Object>  data = queryReimbursement(j, pageSize,startLockTime,endLockTime)
+                        if(data.successFlag == false){
+                            flag = false
+                            errorMessage = data.response
+                            //编辑错误信息 并且终止程序
+                            statistic.count = 0
+                            statistic.lecture_code_empty = 0
+                            statistic.day = day
+                            //任务执行时间,任务执行方式,是否成功,错误信息,
+                            statistic.code = "失败"
+                            statistic.mode = "手动触发action"
+                            statistic.message = data.response
+                            statistic.empty_lecture_message = ""
+
+                            statisticList.add(statistic)
+                            //失败,全部结束
+                            break a
+                        }
+                        Map<String,Object> datas = data.response
+                        list.addAll(datas.DATA)
+                    }
+
+                    //LectureCode不为空的
+                    List<IDataRecord> list1 = list.stream().filter(){e-> e.LectureCode != null && e.LectureCode != ""}.collect(Collectors.toList())
+
+                    List<String> lectureCodes =  list1.stream().map{e-> e.LectureCode}.collect(Collectors.toList())
+                    List<IDataRecord> customerData = queryCustomerData( lectureCodes)
+                    if(customerData != null && customerData.size() > 0){
+                        Map<String,Object> customerDataMap = new HashMap<>()
+                        customerData.stream().forEach(){e-> customerDataMap.put(e.getExternalId(), e.getId())}
+                        list1.forEach(){e-> e.put("lecture", customerDataMap.get(e.LectureCode)) }
+                    }
+                    //list2 讲者编码在customer中存在的,也就是需要保存到数据库的
+                    List<IDataRecord> list2 = new ArrayList<>()
+                    if(list1 != null){
+                        list2 = list1.stream().filter(){e-> e.lecture != null && e.lecture != ""}.collect(Collectors.toList())
+                    }
+//                    List<IDataRecord> list1 = list.stream().filter(){e-> e.LectureCode != null && e.LectureCode != ""}.collect(Collectors.toList())
+                    resList.addAll(list2)
+                    List<IDataRecord> emptyLectureCode = list.stream().filter(){e-> e.LectureCode == null || e.LectureCode == ""}.collect(Collectors.toList())
+                    List<IDataRecord> emptyLecture = list1.stream().filter(){e-> e.lecture == null || e.lecture == ""}.collect(Collectors.toList())
+
+                    emptyList.addAll(emptyLectureCode)
+                    emptyList.addAll(emptyLecture)
+                }
+
+                int emptyCount = 0
+                String join = ""
+                List<IDataRecord> dataRecords = new ArrayList<>()
+                if(emptyList != null){
+                    emptyCount = emptyList.size()
+                    emptyList.stream().forEach{e->
+                        IDataRecord dataRecord = new DataRecord()
+                        dataRecord.put("DocumentNO",e.DocumentNO)
+                        dataRecord.put("LectureCode",e.LectureCode)
+                        dataRecord.put("LectureName",e.LectureName)
+                        dataRecords.add(dataRecord)
+                    }
+                    join = Joiner.on(",").join(dataRecords)
+                }
+                statistic.count = response.COUNT
+                statistic.lecture_code_empty = emptyCount
+                statistic.day = day
+                //任务执行时间,任务执行方式,是否成功,错误信息,
+                statistic.code = "成功"
+                statistic.mode = "手动触发action"
+                statistic.message = ""
+                statistic.empty_lecture_message = join
+                statisticList.add(statistic)
+
+            }else{
+                flag = false
+                errorMessage = response
+                int emptyCount = 0
+                if(emptyList != null){
+                    emptyCount = emptyList.size()
+                }
+                int count = 0
+                if(response != null && response.COUNT != null){
+                    count = response.COUNT
+                }
+                statistic.count = count
+                statistic.lecture_code_empty = emptyCount
+                statistic.day = day
+                //任务执行时间,任务执行方式,是否成功,错误信息,
+                statistic.code = "失败"
+                statistic.mode = "手动触发action"
+                statistic.message = response
+                statistic.empty_lecture_message = ""
+                statisticList.add(statistic)
+                break
+            }
+        }
+        if(flag){
+            IObjectDescribe objectDescribe = objectDescribeService.findByApiName("reimbursement_document")
+            deletedDate( objectDescribe)
+            if(resList != null && resList.size() > 0){
+                saveReimbursement( resList)
+            }
+            saveReimbursementStatistics(statisticList)
+            redisTemplate.delete(setKey)
+            MapRestResponse.build(HeadCode.SUCCESS)
+        }else{
+            saveReimbursementStatistics(statisticList)
+            HeadCode headCode=HeadCode.ERROR
+            if(errorMessage == null){
+                errorMessage = "调用接口失败"
+            }
+            redisTemplate.delete(setKey)
+            headCode.msg = errorMessage
+            MapRestResponse.build(headCode)
+        }
+
+    }
+
+    def queryReimbursement(int  pageNo, int pageSize, String startLockTime, String endLockTime){
+        //TODO:超时重试机制
+        def continueTrigFlag = true
+        def retryNum = 0
+        def retryCell = 5
+
+        Map<String,Object> response = new HashMap<>()
+        while (continueTrigFlag && retryNum <= retryCell) {
+            try {
+                response = queryInter( pageNo, pageSize, startLockTime, endLockTime)
+                if (response.CODE == 200) {
+                    continueTrigFlag = false
+                    System.out.println("trigger success")
+                }else{
+                    retryNum++
+                }
+            } catch (Exception e) {
+                retryNum++
+                logger.error("trigger retry:"+e.getMessage())
+                System.out.println("trigger retry:"+e.getMessage())
+            }
+        }
+        Map<String,Object> map = new HashMap<>()
+        map.put("successFlag",!continueTrigFlag)
+        map.put("response", response)
+        return map
+    }
+
+    /**
+     * 调用和黄接口查询一天报销单数据
+     */
+    def queryInter(int  pageNo, int pageSize, String startLockTime, String endLockTime){
+
+        String appToken = getAppToken()
+        String nonce = UUID.randomUUID().toString()
+        Long curTime = System.currentTimeMillis()
+        String checkSum = DigestUtils.sha1Hex(appToken + nonce + curTime)
+
+        HttpHeaders headers = new HttpHeaders()
+        headers.set("AppToken", appToken)
+        headers.set("Nonce", nonce)
+        headers.set("CurTime", String.valueOf(curTime))
+        headers.set("CheckSum", checkSum)
+        headers.setContentType(MediaType.APPLICATION_JSON)
+
+        Map param = new HashMap()
+        param.put("JsonData","{\"BusinessType\":\"报销单归档\",\"EndLockTime\":\""+endLockTime+"\",\"pageNo\":"+pageNo+",\"pageSize\":"+pageSize+",\"StartLockTime\":\""+startLockTime+"\"}")
+        HttpEntity<Object> request = new HttpEntity<>(param, headers)
+
+        def response
+        try {
+            response = restTemplate.postForObject(getReimbursementDataUrl()+"PMSAPI/PmsApi/YStoPMS", request, Map.class) as Map
+        } catch (RestClientException err) {
+            logger.error(err.toString(), err)
+        } finally {
+            if (logger.isInfoEnabled()) {
+                logger.info('finish request workflow cancel')
+            }
+        }
+        return response
+    }
+
+    /**
+     * 保存近三天和黄返回的报销单数据
+     */
+    def saveReimbursement(List<IDataRecord> list){
+
+        IObjectDescribe objectDescribe = objectDescribeService.findByApiName("reimbursement_document")
+
+        if (null != list && list.size() > 0) {
+            List<IDataRecord> saveDataRecord = new ArrayList<>()
+            for (int i = 0; i < list.size(); i++) {
+                Map<String,Object> dataRecord = list.get(i)
+                Set<String> keySet = dataRecord.keySet()
+                IDataRecord newDataRecord = new DataRecord()
+                for (int j = 0; j < keySet.size(); j++) {
+                    String key = keySet.getAt(j)
+                    if (null == CustomerDataDict.map.get(key)) {
+                        continue
+                    }
+                    String newKey = CustomerDataDict.map.get(key).getField()
+                    if(key == "ActivityStartDate" || key == "ActivityEndDate" || key == "AccountDate" || key == "DocumentData" || key == "AccountLockTime") {
+                        String oldDateStr = dataRecord.get(key)
+                        if(oldDateStr == null){
+                            newDataRecord.put(newKey, null)
+                            continue
+                        }
+                        String[] parsePatterns = ["yyyy-MM-dd'T'HH:mm:ss.SSS","yyyy-MM-dd'T'HH:mm:ss.SS","yyyy-MM-dd'T'HH:mm:ss","yyyy-MM-dd'T'HH:mm","yyyy-MM-dd'T'HH","yyyy-MM-dd"]
+                        Date date = DateUtils.parseDate(oldDateStr, parsePatterns)
+                        Instant instant = date.toInstant()
+                        ZoneId zone = ZoneId.systemDefault()
+                        LocalDateTime dateTime = LocalDateTime.ofInstant(instant, zone)
+                        Long time = dateTime.toInstant(ZoneOffset.of("+8")).toEpochMilli()
+                        newDataRecord.put(newKey, time)
+                    }else{
+                        newDataRecord.put(newKey, dataRecord.get(key))
+                    }
+                }
+                saveDataRecord.add(newDataRecord)
+            }
+            dataRecordService.batchInsert(ContextHolder.getHolder().get(), objectDescribe, saveDataRecord)
+        }
+    }
+
+
+    def deletedDate(IObjectDescribe objectDescribe){
+        ZoneId zone = ZoneId.of("UTC+8")
+        Instant endTime = LocalDateTime.of(LocalDate.now().minusDays(0), LocalTime.MAX).toInstant(ZoneOffset.of("+8"))
+        Long endTimestamp = LocalDateTime.ofInstant(endTime, zone).atZone(zone).toInstant().toEpochMilli()
+
+        Instant startTime = LocalDateTime.of(LocalDate.now().minusDays(3), LocalTime.MIN).toInstant(ZoneOffset.of("+8"))
+        Long startTimestamp = LocalDateTime.ofInstant(startTime, zone).atZone(zone).toInstant().toEpochMilli()
+
+        List<IDataRecord> dataRecords = queryReimbursements( startTimestamp, endTimestamp)
+        if(dataRecords != null && dataRecords.size() > 0){
+            List<Long> idList = dataRecords.stream().map{e-> e.getId()}.collect(Collectors.toList())
+            Long[] ids = idList.toArray()
+            dataRecordService.batchDelete(ContextHolder.getHolder().get(), objectDescribe, ids)
+        }
+    }
+
+    /**
+     * 保存近三天的报销单统计
+     */
+    def saveReimbursementStatistics(List<IDataRecord> statisticList){
+        IObjectDescribe objectDescribe = objectDescribeService.findByApiName("reimbursement_statistics")
+        dataRecordService.batchInsert(ContextHolder.get(), objectDescribe,statisticList)
+    }
+
+    def queryReimbursements(Long startTimestamp, Long endTimestamp) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'reimbursement_document'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("lock_time", ">=", startTimestamp))
+        queryDept.criterias.add(new Criteria("lock_time", "<=", endTimestamp))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    def queryCustomerData(List<String> lectureCode) {
+        def queryDept = new Query()
+        queryDept.objectApiName = 'customer'
+        queryDept.pageNo = 1
+        queryDept.pageSize = Integer.MAX_VALUE
+        queryDept.joiner = 'and'
+        queryDept.order = 'asc'
+        queryDept.orderBy = 'id'
+        queryDept.criterias.add(new Criteria("external_id", "in", lectureCode))
+        queryDept.criterias.add(new Criteria("is_deleted", "==", false))
+        def result = dataRecordRepository.query(queryDept).result as List<IDataRecord>
+        if (result)
+            return result
+        null
+    }
+
+    def getReimbursementDataUrl() {
+        def active = env.getProperty("spring.profiles.active") as String
+        switch (active) {
+            case "dev": return "http://pms.shpl.com.cn:96/"
+                break
+            case "stage": return "http://pms.shpl.com.cn:96/"
+                break
+            case "prod": return "http://pms.shpl.com.cn:95/"
+                break
+            default:
+                break
+        }
+        return "http://pms.shpl.com.cn:96/"
+    }
+
+    def getAppToken(){
+        def active = env.getProperty("spring.profiles.active") as String
+        switch (active) {
+            case "dev": return "0398702548152d9b915c8d8d6b86ca59"
+                break
+            case "stage": return "0398702548152d9b915c8d8d6b86ca59"
+                break
+            case "prod": return "0398702548152d9b915c8d8d6b86ca59"
+                break
+            default:
+                break
+        }
+        return "0398702548152d9b915c8d8d6b86ca59"
+    }
+
+    enum CustomerDataDict {
+        LABOR_TYPE("LabourType", "labor_type"),
+        SUM_MONEY("SumMoney", "sum_money"),
+        DOCUMENT_PLACE("DocumentPlace", "document_place"),
+        DOCUMENT_DATA("DocumentData", "document_date"),
+        LECTURE_CODE("LectureCode", "lecture_code"),
+        LOCK_TIME("AccountLockTime", "lock_time"),
+        EXTENSION_CONTENT("ExtensionContent", "extension_content"),
+        PROJECT_NAME("ProjectName", "project_name"),
+        COVERING_TOTAL_NUM_PERSON("CoveringTotalNumPerson", "covering_total_number_person"),
+        PRODUCT_NAME("ProductName", "product_name"),
+        ACTIVITY_PLACE("ActivityPlace", "activity_place"),
+        ACTIVITY_END_DATE("ActivityEndDate", "activity_start_date"),
+        ACTIVITY_START_DATE("ActivityStartDate", "activity_end_date"),
+        DOCUMENT_NO("DocumentNO", "document_no"),
+        LECTURE("lecture", "lecture")
+
+        private String name
+        private String field
+        CustomerDataDict(String name, String field) {
+            this.name = name
+            this.field = field
+        }
+        String getName() {
+            return name
+        }
+        void setName(String name) {
+            this.name = name
+        }
+        String getField() {
+            return field
+        }
+        void setField(String field) {
+            this.field = field
+        }
+        public static final Map<String, CustomerDataDict> map = new HashMap<>()
+        static {
+            for (CustomerDataDict dict : values()) {
+                map.put(dict.getName(), dict)
+            }
+        }
+    }
+
+}
